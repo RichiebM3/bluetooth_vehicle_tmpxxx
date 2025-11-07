@@ -1,0 +1,372 @@
+// RICHARD A BRUCE
+// LAB 12
+// PWM MOTOR DRIVER LAB
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include "tm4c123gh6pm.h"
+
+
+#define FULL_SPEED 4999
+#define TURN_SPEED 3000
+#define STOP_SPEED 0 
+
+void PortF_Init(void);
+void PWM_Init(void);
+void Timer1A_1sd(void);
+void timer1A_delay(int ttime);
+void frontDrive(void);
+void reverseDrive(void);
+void stopMotors(void);
+void test_uart(void);
+
+void portA_init(void);
+void HC05_Init(void);
+void write_string(char *str);
+void blueTooth_Write(unsigned char data);
+void Bluetooth_init(void);
+void test_bluetooth(void);
+char blueTooth_Read(void);
+
+int duty_cycle1 = 4999; // 7812
+int duty_cycle2 = 7812;
+int cycle_count = 5000;
+char display_buffer[64];
+
+// Motor control functions modified for L298N dual H-bridge
+void frontDrive(void){
+    // For forward motion:
+    // Motor 1 (OUT1/OUT2): PA2 high, PA3 low
+    // Motor 2 (OUT3/OUT4): PA2 high, PA3 low
+    GPIO_PORTA_DATA_R |= 0x4;     // Set PA2 high
+    GPIO_PORTA_DATA_R &= ~0x8;    // Set PA3 low
+    
+    // Set both motors to run at full speed
+    PWM0_0_CMPA_R = FULL_SPEED;   // Motor 1 speed (OUT1/OUT2)
+    PWM0_0_CMPB_R = FULL_SPEED;   // Motor 2 speed (OUT3/OUT4)
+    
+    GPIO_PORTF_DATA_R = 0x08;     // Blue LED to indicate forward
+    write_string("Moving Forward - Both Motors");
+}
+
+void reverseDrive(void){
+    // For reverse motion:
+    // Motor 1 (OUT1/OUT2): PA2 low, PA3 high
+    // Motor 2 (OUT3/OUT4): PA2 low, PA3 high
+    GPIO_PORTA_DATA_R &= ~0x4;    // Set PA2 low
+    GPIO_PORTA_DATA_R |= 0x8;     // Set PA3 high
+    
+    // Set both motors to run at full speed
+    PWM0_0_CMPA_R = FULL_SPEED;   // Motor 1 speed (OUT1/OUT2)
+    PWM0_0_CMPB_R = FULL_SPEED;   // Motor 2 speed (OUT3/OUT4)
+    
+    GPIO_PORTF_DATA_R = 0x04;     // Green LED to indicate reverse
+    write_string("Moving Backward - Both Motors");
+}
+
+void stopMotors(void){
+    // Stop both motors
+    GPIO_PORTA_DATA_R &= ~0xC;    // Set both PA2 and PA3 low
+    PWM0_0_CMPA_R = STOP_SPEED;   // Stop first motor pair
+    PWM0_0_CMPB_R = STOP_SPEED;   // Stop second motor pair
+    GPIO_PORTF_DATA_R = 0x02;     // Red LED for stop indication
+    write_string("Motors Stopped");
+}
+
+
+//BLUETOOTH FUNCTIONS
+void Bluetooth_init(void){
+    SYSCTL_RCGCGPIO_R |= 0x10;        // Enable clock to PORTE
+    while((SYSCTL_PRGPIO_R & 0x10) == 0){};
+    
+    GPIO_PORTE_AMSEL_R &= ~0x30;      // Disable analog function on PE4,PE5
+    GPIO_PORTE_AFSEL_R |= 0x30;       // Enable alternate function
+    GPIO_PORTE_PCTL_R &= ~0x00FF0000;
+    GPIO_PORTE_PCTL_R |= 0x00110000;  // Configure PE4,PE5 for UART
+    GPIO_PORTE_DEN_R |= 0x30;         // Enable digital I/O on PE4,PE5
+    GPIO_PORTE_DIR_R |= 0x20;         // Set PE5 as output (TX)
+    GPIO_PORTE_DIR_R &= ~0x10;        // Set PE4 as input (RX)
+}
+
+
+void HC05_Init(void){
+    SYSCTL_RCGCUART_R |= 0x20;        // Enable UART5 clock
+    while((SYSCTL_PRUART_R & 0x20) == 0){};
+    
+    UART5_CTL_R &= ~0x01;             // Disable UART5
+    
+    // For 9600 baud rate with 50MHz clock:
+    UART5_IBRD_R = 325;               
+    UART5_FBRD_R = 33;
+    
+    UART5_LCRH_R = 0x60;              // 8-bit, no parity, one stop bit
+    UART5_CC_R = 0x0;                 // Use system clock
+    UART5_CTL_R |= 0x301;             // Enable UART5, TXE, RXE
+    
+    // Add initialization status check
+    write_string("UART5 Initialized");
+    sprintf(display_buffer, "UART5_FR_R: 0x%x", UART5_FR_R);
+    write_string(display_buffer);
+    sprintf(display_buffer, "UART5_CTL_R: 0x%x", UART5_CTL_R);
+    write_string(display_buffer);
+}
+
+
+void blueTooth_Write(unsigned char data){
+    while((UART5_FR_R & (1<<5)) != 0); // Wait until Tx buffer not full
+    UART5_DR_R = data;
+    timer1A_delay(1);  // Add small delay between characters
+}
+
+void write_string(char *str){
+    int i;
+    for (i = 0; i < strlen(str); i++){
+        blueTooth_Write(str[i]);
+    }
+    // Add carriage return and line feed
+    blueTooth_Write('\r');
+    blueTooth_Write('\n');
+    timer1A_delay(10);  // Delay between messages
+}
+char blueTooth_Read(void){
+    uint32_t timeout = 5000000;  // Increased timeout
+    char received;
+    
+    write_string("Waiting for Bluetooth data...");
+    
+    // Check UART flags before waiting
+    sprintf(display_buffer, "UART5_FR_R: 0x%x", UART5_FR_R);
+    write_string(display_buffer);
+    
+    // Wait for data with timeout
+    while((UART5_FR_R & (1<<4)) != 0 && timeout > 0) { 
+        timeout--;
+        for(int i = 0; i < 10; i++){} // Small delay
+    }
+    
+    if(timeout == 0) {
+        write_string("ERROR: Bluetooth read timeout");
+        sprintf(display_buffer, "Final UART5_FR_R: 0x%x", UART5_FR_R);
+        write_string(display_buffer);
+        return 0;
+    }
+    
+    received = (unsigned char)(UART5_DR_R & 0xFF);
+    sprintf(display_buffer, "Received: %c", received);
+    write_string(display_buffer);
+    
+    return received;
+}
+
+
+void test_uart(void){
+    write_string("Testing UART TX/RX...");
+    
+    // Send test character
+    blueTooth_Write('T');
+    timer1A_delay(100);
+    
+    // Check if any data received
+    if((UART5_FR_R & (1<<4)) == 0){
+        char c = (unsigned char)(UART5_DR_R & 0xFF);
+        sprintf(display_buffer, "Read back: %c", c);
+        write_string(display_buffer);
+    } else {
+        write_string("No data received");
+    }
+}
+
+
+void test_bluetooth(void) {
+    write_string("Testing Bluetooth Communication");
+    write_string("If you can read this, Bluetooth is working");
+    
+    // Send some test values
+    for(int i = 0; i < 5; i++) {
+        sprintf(display_buffer, "Test message %d", i);
+        write_string(display_buffer);
+        timer1A_delay(500);
+    }
+}
+void PWM_Init(void){
+    // PWM for PB6: M0PWM0 : Module 0 Generator 0 A
+    // PWM for PB7: M0PWM1 : Module 0 Generator 0 B
+    SYSCTL_RCGCPWM_R |= 0x01;     // Enable PWM module 0
+    SYSCTL_RCGC2_R |= 0x02;       // Enable Port B clock
+    while((SYSCTL_PRPWM_R & 0x01) != 0x01); // Wait for PWM peripheral ready
+    
+    // Configure PWM clock division
+    SYSCTL_RCC_R &= ~0x001E0000;  // Clear PWMDIV field
+    SYSCTL_RCC_R |= 0x001E0000;   // Configure for /64 divider
+    
+    // Configure Port B pins for PWM
+    GPIO_PORTB_CR_R |= 0xC0;      // Allow changes to PB6-7
+    GPIO_PORTB_AFSEL_R |= 0xC0;   // Enable alternate function on PB6-7
+    GPIO_PORTB_PCTL_R &= ~0xFF000000; // Clear PCTL bits for PB6-7
+    GPIO_PORTB_PCTL_R |= 0x44000000;  // Configure PB6-7 for PWM
+    GPIO_PORTB_DEN_R |= 0xC0;     // Enable digital I/O on PB6-7
+    
+    // Configure PWM Generator 0
+    PWM0_0_CTL_R = 0;            // Disable PWM0 generator 0
+    PWM0_0_GENA_R = 0xC8;        // Drive pwm0A high when counter = LOAD, low when matches CMPA
+    PWM0_0_GENB_R = 0xC08;       // Drive pwm0B high when counter = LOAD, low when matches CMPB
+    PWM0_0_LOAD_R = cycle_count; // Set PWM period
+    PWM0_0_CMPA_R = duty_cycle1; // Set initial duty cycle for motor 1
+    PWM0_0_CMPB_R = duty_cycle2; // Set initial duty cycle for motor 2
+    PWM0_0_CTL_R = 1;           // Enable PWM0 generator 0
+    
+    PWM0_ENABLE_R = 0x03;       // Enable PWM0 and PWM1 outputs
+}
+
+
+void portA_init(void){
+    SYSCTL_RCGCGPIO_R |= 0x01;        // Enable clock to PORTA
+    while((SYSCTL_PRGPIO_R & 0x01) == 0){}; // Wait for clock to stabilize
+    
+    GPIO_PORTA_AMSEL_R &= ~0x0C;      // Disable analog function on PA2,PA3
+    GPIO_PORTA_PCTL_R &= ~0x0000FF00; // GPIO clear bit PCTL for PA2,PA3
+    GPIO_PORTA_DIR_R |= 0x0C;         // Set PA2,PA3 as outputs
+    GPIO_PORTA_AFSEL_R &= ~0x0C;      // No alternate function
+    GPIO_PORTA_DEN_R |= 0x0C;         // Enable digital I/O on PA2,PA3
+    GPIO_PORTA_DATA_R &= ~0x0C;       // Initialize PA2,PA3 to 0
+}
+
+void PortF_Init(void){
+		volatile unsigned long delay;
+		SYSCTL_RCGC2_R |= 0x32;     // 1) B, E, F port clock 
+		 delay = SYSCTL_RCGC2_R;
+		GPIO_PORTF_LOCK_R = 0x4C4F434B;   // 2) unlock PortF PF0  
+		GPIO_PORTF_CR_R = 0x1F;           // allow changes to PF4-0       
+		GPIO_PORTF_AMSEL_R = 0x00;        // 3) disable analog function
+		//GPIO_PORTF_PCTL_R = 0x00000000;   // 4) GPIO clear bit PCTL  
+		GPIO_PORTF_DIR_R = 0x0E;          // 5) PF4,PF0 input, PF3,PF2,PF1 output   
+		GPIO_PORTF_AFSEL_R = 0x00;        // 6) no alternate function
+		GPIO_PORTF_PUR_R = 0x11;          // enable pullup resistors on PF4,PF0       
+		GPIO_PORTF_DEN_R = 0x1F;          // 7) enable digital pins PF4-PF0
+	
+}
+
+void Timer1A_1sd(void){
+		SYSCTL_RCGCTIMER_R |= 0x02;     /* enable clock to Timer0, Timer1, Timer2 */
+    TIMER1_CTL_R = 0x00;            /* disable Timer before initialization */
+    TIMER1_CFG_R = 0x04;         /* 32-bit option */
+    TIMER1_TAMR_R = 0x02;        /* periodic mode and down-counter */
+    TIMER1_TAILR_R = 50 - 1;  /* Timer A interval load value register */
+    TIMER1_ICR_R = 0x1;          /* clear the TimerA timeout flag*/
+    TIMER1_CTL_R |= 0x01;        /* enable Timer A after initialization */
+		TIMER1_TAPR_R = 3-1;					// Prescalar value.. Can extend the cycle time max 256 times
+}
+
+void timer1A_delay(int ttime){  // x times 1-sec delay
+    //Timer1A_1sd();
+		int i;
+	
+    for(i = 0; i < ttime; i++) { 
+			while ((TIMER1_RIS_R & 0x01) == 0);      /* wait for TimerA timeout flag */
+        TIMER1_ICR_R = 0x01;      /* clear the TimerA timeout flag */
+    }
+}
+
+unsigned long int SW1;
+unsigned long int SW2;
+
+int main(void){
+ PortF_Init();
+    Timer1A_1sd();
+    PWM_Init();
+    portA_init();
+    
+    // Initial LED indication
+    GPIO_PORTF_DATA_R = 0x02;  // Red LED - starting up
+    
+    Bluetooth_init();
+    HC05_Init();
+    
+    write_string("System Initialization Complete");
+    
+    // Test UART communication
+    test_uart();
+    timer1A_delay(1000);
+    
+    test_bluetooth();
+    write_string("Bluetooth configuration complete");
+    write_string("Vehicle Control System Ready");
+    
+    // Change LED to indicate ready
+    GPIO_PORTF_DATA_R = 0x08;  // Blue LED - ready
+    
+    char command;
+    int base_duty = duty_cycle1;
+    int turn_duty = (int)(duty_cycle1 * 0.6);
+    
+    while(1){
+        command = blueTooth_Read();
+        
+        switch(command) {
+ case 'S': // Forward
+                frontDrive();
+                PWM0_0_CMPA_R = base_duty;    // Full speed both motors
+                PWM0_0_CMPB_R = base_duty;
+                write_string("Moving Forward");
+                break;
+                
+            case 'B': // Backward
+                reverseDrive();
+                PWM0_0_CMPA_R = base_duty;    // Full speed both motors
+                PWM0_0_CMPB_R = base_duty;
+                write_string("Moving Backward");
+                break;
+                
+            case 'H': // Stop
+                GPIO_PORTA_DATA_R &= ~0xC;     // Clear both direction control pins
+                PWM0_0_CMPA_R = 0;            // Zero duty cycle
+                PWM0_0_CMPB_R = 0;
+                GPIO_PORTF_DATA_R = 0x02;      // Red LED
+                write_string("Stopped");
+                break;
+                
+            case 'C': // Left 45 degrees
+                frontDrive();
+                PWM0_0_CMPA_R = turn_duty;     // Reduce right motor speed
+                PWM0_0_CMPB_R = base_duty;     // Left motor full speed
+                timer1A_delay(15000);           // Adjust for 45-degree turn
+                write_string("Turning Left 45");
+                break;
+                
+            case 'D': // Right 45 degrees
+                frontDrive();
+                PWM0_0_CMPA_R = base_duty;     // Right motor full speed
+                PWM0_0_CMPB_R = turn_duty;     // Reduce left motor speed
+                timer1A_delay(15000);           // Adjust for 45-degree turn
+                write_string("Turning Right 45");
+                break;
+                
+            case 'E': // Left 90 degrees
+                frontDrive();
+                PWM0_0_CMPA_R = turn_duty;     // Reduce right motor speed
+                PWM0_0_CMPB_R = base_duty;     // Left motor full speed
+                timer1A_delay(30000);           // Adjust for 90-degree turn
+                write_string("Turning Left 90");
+                break;
+                
+            case 'F': // Right 90 degrees
+                frontDrive();
+                PWM0_0_CMPA_R = base_duty;     // Right motor full speed
+                PWM0_0_CMPB_R = turn_duty;     // Reduce left motor speed
+                timer1A_delay(30000);           // Adjust for 90-degree turn
+                write_string("Turning Right 90");
+                break;
+        }
+        
+        // After each command, reset to stop state
+        if(command != 'S' && command != 'B') {  // Don't reset if moving straight
+            GPIO_PORTA_DATA_R &= ~0xC;          // Clear direction control
+            PWM0_0_CMPA_R = 0;                 // Stop motors
+            PWM0_0_CMPB_R = 0;
+        }
+        
+        timer1A_delay(100);  // Small delay between commands
+    }
+}   
